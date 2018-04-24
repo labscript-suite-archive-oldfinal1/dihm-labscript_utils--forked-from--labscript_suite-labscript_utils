@@ -64,7 +64,7 @@ class DoubleImportDenier(object):
         self.names_by_filepath = {}
         self.tracebacks = {}
         UNKNOWN = ('<unknown: imported prior to double_import_denier.enable()>\n')
-        for name, module in sys.modules.items():
+        for name, module in list(sys.modules.items()):
             if hasattr(module, '__file__'):
                 path = os.path.realpath(module.__file__)
                 self.names_by_filepath[path] = name
@@ -75,8 +75,8 @@ class DoubleImportDenier(object):
         name = fullname.split('.')[-1]
         try:
             fp, pathname, description = imp.find_module(name, path)
-        except ImportError:
-            if DEBUG: print('ImportError')
+        except Exception as e:
+            if DEBUG: print('Exception in imp.find_module ' + str(e))
             return None
         if pathname is not None:
             path = os.path.realpath(pathname)
