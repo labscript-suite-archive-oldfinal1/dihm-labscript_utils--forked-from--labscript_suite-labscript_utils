@@ -24,7 +24,6 @@
 # Future imports to ease change to Python 3.
 from __future__ import print_function, absolute_import, unicode_literals, division
 import time
-import Queue
 import pypylon
 import numpy as np
 import threading
@@ -34,11 +33,16 @@ import zprocess
 # optotunelens.py unit conversion
 # scipy has bug that installs Fortran ctrl-C handler that overrides
 # python's keyboard interrupt handling
-from labscript_utils import check_version
+from labscript_utils import check_version, PY2
 import labscript_utils.shared_drive
 import labscript_utils.h5_lock, h5py
 from labscript_utils.camera_server import CameraServer
 check_version('zprocess', '1.3.3', '3.0')
+
+if PY2:
+    import Queue
+else:
+    import queue as Queue
 
 class PyPylon_Camera(object):
 
@@ -59,11 +63,18 @@ class PyPylon_Camera(object):
         # Turn off Auto Exposure & Gain
         self.cam.properties['ExposureAuto'] = 'Off'
         self.cam.properties['GainAuto'] = 'Off'
-        # Set gain to 0 dB
-        self.cam.properties['Gain'] = 0.0
+        try:
+            # parameter names have changed between our usb3 and gige cams
+            # Set gain to 0 dB
+            self.cam.properties['Gain'] = 0.0
+        except KeyError:
+            pass
         # Set black level (a.k.a. Brightness)
         self.cam.properties['BlackLevelSelector'] = 'All'
-        self.cam.properties['BlackLevel'] = 0.0
+        try:
+            self.cam.properties['BlackLevel'] = 0.0
+        except KeyError:
+            self.cam.properties['BlackLevelRaw'] = 0
         
         # save some parameters to the class for lookup in other functions
         self.maxX = self.cam.properties['WidthMax']
@@ -73,6 +84,10 @@ class PyPylon_Camera(object):
         self.height = self.cam.properties['Height']
         self.offX = self.cam.properties['OffsetX']
         self.offY = self.cam.properties['OffsetY']
+        
+        # defualt to software triggers and rising edge activation
+        self.setTriggerMode('Off')
+        self.configureTrigger('rising')
 
         # these settings likely to become configurable later
         self.setFormat('Mono12')
@@ -92,6 +107,10 @@ class PyPylon_Camera(object):
     def disconnect(self):
         print('Closing Camera....')
         self.cam.close()
+        
+    def reconnect(self):
+        print('Reconnected to same Camera....')
+        self.cam.open()
         
     def find_camera(self, sn):
         '''Find the camera with the specified serial number as string'''
@@ -119,17 +138,27 @@ class PyPylon_Camera(object):
                     exp_time = args
                     self.setExposureTime(exp_time)
                     continue # skips put into results_queue
-                elif command == 'set_trigger_mode':
+                elif command == 'configure_trigger':
                     polarity = args
-                    self.setTriggerMode(polarity)
+                    self.configureTrigger(polarity)
+                    continue
+                elif command == 'set_trigger_mode':
+                    mode = args
+                    self.setTriggerMode(mode)
                     continue
                 elif command == 'set_ROI':
                     if (self.width,self.height,self.offX,self.offY) != args: 
                         self.setROI(*args)
                     continue
+                elif command == 'disconnect':
+                    self.disconnect()
+                    continue
+                elif command == 'reconnect':
+                    self.reconnect()
+                    continue
                 elif command == 'abort':
                     # clear out results queue when aborting
-                    results_queue.get_nowait()
+                    self.results_queue.get_nowait()
                 elif command == 'quit':
                     break
                 else:
@@ -140,11 +169,10 @@ class PyPylon_Camera(object):
             # shutdown camera when loop quits
             self.disconnect()
 
-    def setTriggerMode(self,trigPolarity):
+    def configureTrigger(self,trigPolarity):
         '''Setup camera for standard hardware trigger on Line1 source.
         Polarity is configurable: \'rising\' or \'falling\''''
         self.cam.properties['TriggerSelector'] = 'FrameStart'
-        self.cam.properties['TriggerMode'] = 'On'
         self.cam.properties['TriggerSource'] = 'Line1'
         if 'rising' in trigPolarity:
             pol = 'RisingEdge'
@@ -154,11 +182,19 @@ class PyPylon_Camera(object):
             raise Exception('Unknown trigger type {}'.format(trigPolarity))
         self.cam.properties['TriggerActivation'] = pol
         
+    def setTriggerMode(self,mode):
+        '''Toggles trigger mode on and off.
+        Options are \'On\' and \'Off\' '''
+        self.cam.properties['TriggerMode'] = mode
+        
     def setExposureTime(self,exp_time):
         '''Configures the camera exposure settings for timed exposure
         Exposure time is in seconds'''
         self.cam.properties['ExposureMode'] = 'Timed'
-        self.cam.properties['ExposureTime'] = int(exp_time*1.0E6)
+        try:
+            self.cam.properties['ExposureTime'] = int(exp_time*1.0E6)
+        except KeyError:
+            self.cam.properties['ExposureTimeRaw'] = int(exp_time*1.0E6)
         
     def setFormat(self,pix_format):
         '''Sets the pixel format to allowed format
@@ -207,7 +243,11 @@ class PyPylon_Camera(object):
         self.width = width
         self.height = height
         # readout time depends on ROI
-        print('ReadoutTime:',self.cam.properties['SensorReadoutTime']*1E-3,'ms')
+        try:
+            readout_time = self.cam.properties['SensorReadoutTime']
+        except KeyError:
+            readout_time = self.cam.properties['ReadoutTimeAbs']
+        print('ReadoutTime:',readout_time*1E-3,'ms')
 
     def grabMultiple(self, n_images):
         '''Grab multiple images from camera'''
@@ -221,6 +261,10 @@ class PyPylon_Camera(object):
             print('{:d} of {:d} images acquired!'.format(i+1,n_images))
         return imgs
 
+import click
+import matplotlib.pyplot as plt
+import matplotlib.animation as ani
+
 class PyPylon_CameraServer(CameraServer):
 
     def __init__(self, port, camera_name, serial_number=''):
@@ -228,9 +272,75 @@ class PyPylon_CameraServer(CameraServer):
         self._h5_filepath = None
         self.camera_name = camera_name
         self.cam = PyPylon_Camera(sn=serial_number)
+        
+        # Start thread for detecting keyboard commands
+        self.listener_thread = threading.Thread(target=self.connector,
+                                                        args=())
+        self.listener_thread.daemon = True
+        self.listener_thread.start()
+        print('Listener Thread started....')
+        
+        # start preview window
+        self.fig = plt.figure(camera_name+' SN:'+serial_number)
+        self.ax = plt.subplot(1,1,1)
+        # preload with a dummy image
+        first_preview = self.grab_image()
+        self.preview_dims = first_preview.shape
+        self.preview = self.ax.imshow(first_preview)
+        # callback funtion to update preview plot, update interval is in ms
+        animate = ani.FuncAnimation(self.fig,self.grab_preview,interval=500)
+        
+        # go to default hardware triggering
+        self.cam.command_queue.put(['set_trigger_mode','On'])
+        
+        self.close_preview = False
+        self.run_preview = False
+        self.running_shot = False
+        self.cam_open = True
+        plt.show()
+            
+    def connector(self):
+        '''Listens for single character intput into command window.
+        c-->closes access to camera
+        r-->reconnects to camera
+        p-->starts preview
+        s-->stops preview'''
+        try:
+            while True:
+                c = click.getchar()
+                if c == 'c' and self.cam_open:
+                    self.cam.command_queue.put(['disconnect',None])
+                    self.cam_open = False
+                    continue
+                if c == 'r' and not (self.cam_open or self.running_shot):
+                    self.cam.command_queue.put(['reconnect',None])
+                    self.cam_open = True
+                    continue
+                if c == 'p' and self.cam_open and not (self.run_preview or self.running_shot):
+                    self.cam.command_queue.put(['set_trigger_mode','Off'])
+                    self.run_preview = True
+                    continue
+                if c == 's' and self.run_preview:
+                    self.run_preview = False
+                    self.cam.command_queue.put(['set_trigger_mode','On'])
+                    print('Preview Stopped')
+                    continue
+        except KeyboardInterrupt:
+            self.close_preview = True
+        finally:
+            print('Listener stopped.')
 
     def transition_to_buffered(self, h5_filepath):
         '''Configures acquisitions based on h5_file properties and exp table'''
+        # need to make sure camera is open and not running previews
+        if self.run_preview:
+            self.run_preview = False
+            self.cam.command_queue.put(['set_trigger_mode','On'])
+        if not self.cam_open:
+            self.cam.command_queue.put(['reconnect',None])
+            self.cam_open = True
+        self.running_shot = True
+            
         with h5py.File(h5_filepath) as f:
             groupname = self.camera_name
             group = f['devices'][groupname]
@@ -250,7 +360,7 @@ class PyPylon_CameraServer(CameraServer):
                     self.cam.command_queue.put(['set_exposure_time',props['exposure_time']])
             if 'trigger_edge_type' in props:
                 print('Configuring Trigger Mode....')
-                self.cam.command_queue.put(['set_trigger_mode',props['trigger_edge_type']])
+                self.cam.command_queue.put(['configure_trigger',props['trigger_edge_type']])
                 
         print('Configured for {n} image(s).'.format(n=n_images))
         # Tell the acquisition mainloop to get some images:
@@ -294,6 +404,31 @@ class PyPylon_CameraServer(CameraServer):
                     save_imgs = images[mask]
                 group.create_dataset(f_type,data=save_imgs)
                 print(f_type,'camera shots saving time: {:.5f}'.format(time.time()-start_time),'s')
+        
+        # unblock preview mode
+        self.running_shot = False
+                
+    def grab_image(self):
+        '''Gets single image from camera'''
+        self.cam.command_queue.put(['acquire',1])
+        try:
+            images = self.cam.results_queue.get(timeout=1)
+            if isinstance(images, Exception):
+                raise images
+        except Queue.Empty:
+            print('Timeout in image acquisition.')
+            return np.zeros(self.preview_dims)
+        
+        return images[0]
+        
+    def grab_preview(self,i):
+        '''Gets a preview and updates if self.run_preview = True'''
+        if self.run_preview:
+        
+            self.preview.set_data(self.grab_image())
+            
+        if self.close_preview:
+            plt.close('all')
 
     def abort(self):
         '''If BLACS calls abort, ensure grabMultiple exits'''
@@ -314,7 +449,7 @@ if __name__ == '__main__':
         raise Exception('Call me with the name of a camera as defined in BLACS.')
     # Get the h5 path and camera properties.
     h5_filepath = lc.get('paths', 'connection_table_h5')
-    with h5py.File(h5_filepath) as f:
+    with h5py.File(h5_filepath,'r') as f:
         h5_attrs = labscript_utils.properties.get(f, camera_name,
                                                    'device_properties')
         h5_conn = labscript_utils.properties.get(f, camera_name,
@@ -329,6 +464,7 @@ if __name__ == '__main__':
         server.cam.command_queue.put(['quit', None])
         # The join should timeout so that infinite grab loops do not persist.
         server.cam.acquisition_thread.join(10.0)
+        server.listener_thread.join(10.0)
     except:
         raise
     else:
