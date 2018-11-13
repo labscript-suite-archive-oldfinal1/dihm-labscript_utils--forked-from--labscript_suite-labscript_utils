@@ -33,7 +33,7 @@ import zprocess
 # optotunelens.py unit conversion
 # scipy has bug that installs Fortran ctrl-C handler that overrides
 # python's keyboard interrupt handling
-from labscript_utils import check_version, PY2
+from labscript_utils import check_version, PY2, dedent
 import labscript_utils.shared_drive
 import labscript_utils.h5_lock, h5py
 from labscript_utils.camera_server import CameraServer
@@ -56,25 +56,7 @@ class PyPylon_Camera(object):
         print('Camera Created and Opened...')        
 
         # Ensure some default settings
-        # Ensure no lookup table is used.
-        self.cam.properties['LUTEnable'] = 'False' 
-        # Turn off gamma:
-        self.cam.properties['Gamma'] = 1.0
-        # Turn off Auto Exposure & Gain
-        self.cam.properties['ExposureAuto'] = 'Off'
-        self.cam.properties['GainAuto'] = 'Off'
-        try:
-            # parameter names have changed between our usb3 and gige cams
-            # Set gain to 0 dB
-            self.cam.properties['Gain'] = 0.0
-        except KeyError:
-            pass
-        # Set black level (a.k.a. Brightness)
-        self.cam.properties['BlackLevelSelector'] = 'All'
-        try:
-            self.cam.properties['BlackLevel'] = 0.0
-        except KeyError:
-            self.cam.properties['BlackLevelRaw'] = 0
+        self.cameraDefaultSettings()
         
         # save some parameters to the class for lookup in other functions
         self.maxX = self.cam.properties['WidthMax']
@@ -107,10 +89,38 @@ class PyPylon_Camera(object):
     def disconnect(self):
         print('Closing Camera....')
         self.cam.close()
+        # purpose is usually to use the viewer, which needs TriggerMode \'Off\'
+        self.setTriggerMode('Off')
         
     def reconnect(self):
         print('Reconnected to same Camera....')
         self.cam.open()
+        # trigger mode assumed \'On\' at this point, so ensure that is so
+        self.setTriggerMode('On')
+        
+    def cameraDefaultSettings(self):
+        '''Sets consistent default operation parameters for camera.
+        Most notably, disables gain and other image modifying parameters.'''
+        # Ensure no lookup table is used.
+        self.cam.properties['LUTEnable'] = 'False' 
+        # Turn off gamma:
+        self.cam.properties['Gamma'] = 1.0
+        # Turn off Auto Exposure & Gain
+        self.cam.properties['ExposureAuto'] = 'Off'
+        self.cam.properties['GainAuto'] = 'Off'
+        try:
+            # parameter names have changed between our usb3 and gige cams
+            # Set gain to 0 dB
+            self.cam.properties['Gain'] = 0.0
+        except KeyError:
+            # GigE camera
+            self.cam.properties['GainAbs'] = 0.0
+        # Set black level (a.k.a. Brightness)
+        self.cam.properties['BlackLevelSelector'] = 'All'
+        try:
+            self.cam.properties['BlackLevel'] = 0.0
+        except KeyError:
+            self.cam.properties['BlackLevelRaw'] = 0        
         
     def find_camera(self, sn):
         '''Find the camera with the specified serial number as string'''
@@ -267,7 +277,7 @@ import matplotlib.animation as ani
 
 class PyPylon_CameraServer(CameraServer):
 
-    def __init__(self, port, camera_name, serial_number=''):
+    def __init__(self, port, camera_name, serial_number='', comp_settings={}):
         zprocess.ZMQServer.__init__(self, port, type='string')
         self._h5_filepath = None
         self.camera_name = camera_name
@@ -308,23 +318,39 @@ class PyPylon_CameraServer(CameraServer):
         try:
             while True:
                 c = click.getchar()
-                if c == 'c' and self.cam_open:
+                if c == 'c' and self.cam_open and not self.running_shot:
                     self.cam.command_queue.put(['disconnect',None])
                     self.cam_open = False
                     continue
-                if c == 'r' and not (self.cam_open or self.running_shot):
+                elif c == 'r' and not (self.cam_open or self.running_shot):
                     self.cam.command_queue.put(['reconnect',None])
                     self.cam_open = True
                     continue
-                if c == 'p' and self.cam_open and not (self.run_preview or self.running_shot):
+                elif c == 'p' and self.cam_open and not (self.run_preview or self.running_shot):
                     self.cam.command_queue.put(['set_trigger_mode','Off'])
                     self.run_preview = True
                     continue
-                if c == 's' and self.run_preview:
+                elif c == 's' and self.run_preview:
                     self.run_preview = False
                     self.cam.command_queue.put(['set_trigger_mode','On'])
                     print('Preview Stopped')
                     continue
+                else:
+                    if c in ['c','r','p','s']:
+                        msg = """Command \'%s\' cannot be processed.
+                        Either running a shot or in wrong state.                       
+                        """
+                    else:
+                        # user likely forgot commands, remind them
+                        msg = """Unrecognized command \'%s\'
+                        
+                        Available commands:
+                            c --> closes access to camera
+                            r --> reconnects to camera
+                            p --> starts preview mode
+                            s --> stops preview mode
+                        """
+                    print(dedent(msg)%c)
         except KeyboardInterrupt:
             self.close_preview = True
         finally:
@@ -341,7 +367,7 @@ class PyPylon_CameraServer(CameraServer):
             self.cam_open = True
         self.running_shot = True
             
-        with h5py.File(h5_filepath) as f:
+        with h5py.File(h5_filepath,'r') as f:
             groupname = self.camera_name
             group = f['devices'][groupname]
             props = labscript_utils.properties.get(f, camera_name,'device_properties')
@@ -402,7 +428,7 @@ class PyPylon_CameraServer(CameraServer):
                 else:
                     # save as 3-D array, (n_images,height,width)
                     save_imgs = images[mask]
-                group.create_dataset(f_type,data=save_imgs)
+                group.create_dataset(f_type,data=save_imgs,**comp_settings)
                 print(f_type,'camera shots saving time: {:.5f}'.format(time.time()-start_time),'s')
         
         # unblock preview mode
@@ -442,11 +468,42 @@ if __name__ == '__main__':
     import labscript_utils.h5_lock, h5py
     lc = LabConfig()
     import sys
-    # To start the server, type: "python PyPylon_camera_server <camera_name>".
-    try:
-        camera_name = sys.argv[1]
-    except IndexError:
-        raise Exception('Call me with the name of a camera as defined in BLACS.')
+    import argparse
+    help_text = '''
+    To start the server: python PyPylon_camera_server <camera_name> [options]
+    '''
+    
+    # parse optional arguments and the like
+    parser = argparse.ArgumentParser(description=help_text)
+    # define arguments
+    parser.add_argument('camera',action='store',
+                        help='Camera name to open as defined in BLACS')
+    parser.add_argument('-c','--compression', action='store',
+                        help='Sets compression for saved images in h5 file',
+                        choices=['lzf','gzip','none'],
+                        default='none')
+    parser.add_argument('-s','--shuffle',action='store_true',
+                        help='Toggles shuffle is saved iamges in h5 file')
+    parser.add_argument('-cl','--compression-level',action='store',
+                        help='Sets gzip compression level',
+                        default=4,choices=range(10),type=int)
+    parser.add_argument('--ROI',action='store',
+                        help='Sets ROI: width, height, offsetX, offsetY',
+                        nargs=4,type=int,dest='list')
+                        
+    args=parser.parse_args()
+    
+    camera_name = args.camera
+    
+    comp_settings = {}
+    if args.compression == 'none':
+        comp_settings['compression'] = None
+    else:
+        comp_settings['compression'] = args.compression
+        if args.compression == 'gzip':
+            comp_settings['compression_opts'] = args.compression_level
+    comp_settings['shuffle'] = args.shuffle
+    
     # Get the h5 path and camera properties.
     h5_filepath = lc.get('paths', 'connection_table_h5')
     with h5py.File(h5_filepath,'r') as f:
@@ -456,10 +513,11 @@ if __name__ == '__main__':
                                                  'connection_table_properties')
 
     try:
-        print('starting camera server on port {port}...'.format(port=h5_conn['BIAS_port']))
+        print('Starting camera server on port {}...'.format(h5_conn['BIAS_port']))
         print('Camera serial number {}'.format(h5_attrs['serial_number']))
         # Start the camera server:
-        server = PyPylon_CameraServer(h5_conn['BIAS_port'], camera_name, str(h5_attrs['serial_number']))
+        server = PyPylon_CameraServer(h5_conn['BIAS_port'], camera_name, 
+                                str(h5_attrs['serial_number']), comp_settings)
         server.shutdown_on_interrupt()
         server.cam.command_queue.put(['quit', None])
         # The join should timeout so that infinite grab loops do not persist.
